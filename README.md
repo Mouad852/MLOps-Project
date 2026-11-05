@@ -82,8 +82,12 @@ streamlit run app.py --server.port 8501
 
 The repository includes `backend/test/test_health.py` and a CI workflow that
 installs backend dependencies, runs the health test, and builds the two Docker
-images on `main`. The test configuration uses a local SQLite URL in CI; run the
-workflow or test in your environment before treating it as a passing result.
+images on `main`. The test configuration uses a local SQLite URL in CI.
+
+At the time this README was added, CI reached the checked-in test directory but
+failed during test collection because `app.api.training` imports a missing
+`train_and_compare` function. That application defect is intentionally not
+presented as a passing validation result.
 
 ## Limitations and next steps
 
@@ -92,5 +96,7 @@ workflow or test in your environment before treating it as a passing result.
 - Replace the development-default API key before exposing the service.
 - Add broader tests for dataset ingestion, training, persistence, and
   predictions.
+- Repair the training-module import before relying on the health test as a CI
+  signal.
 - Add artifact storage and deployment documentation before describing the
   project as production-ready.
