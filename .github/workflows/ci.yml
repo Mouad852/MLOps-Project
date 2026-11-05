@@ -20,7 +20,7 @@ jobs:
         working-directory: backend
         env:
           DATABASE_URL: sqlite:///./ci_test.db
-        run: pytest tests -q
+        run: pytest test -q
 
   build-images:
     runs-on: ubuntu-latest
