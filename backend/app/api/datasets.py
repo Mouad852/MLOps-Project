@@ -1,5 +1,7 @@
+import hashlib
 import os
 import uuid
+from pathlib import Path
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, UploadFile
@@ -16,26 +18,43 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 @router.post("/upload", response_model=DatasetOut)
 def upload_dataset(file: UploadFile, db: Session = Depends(get_db)):
-    if not file.filename.endswith(".csv"):
+    filename = file.filename or ""
+    if Path(filename).suffix.lower() != ".csv":
         raise HTTPException(400, "Only CSV files are supported")
+
+    contents = file.file.read()
+    if not contents:
+        raise HTTPException(400, "The CSV file is empty")
+    if len(contents) > settings.max_upload_bytes:
+        raise HTTPException(413, f"CSV files must be smaller than {settings.max_upload_bytes} bytes")
 
     os.makedirs(settings.upload_dir, exist_ok=True)
     dataset_id = uuid.uuid4()
     file_path = os.path.join(settings.upload_dir, f"{dataset_id}.csv")
 
     with open(file_path, "wb") as f:
-        f.write(file.file.read())
+        f.write(contents)
 
-    df = pd.read_csv(file_path)
+    try:
+        df = pd.read_csv(file_path)
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as exc:
+        Path(file_path).unlink(missing_ok=True)
+        raise HTTPException(400, f"Could not parse CSV file: {exc}") from exc
+    if df.empty or len(df.columns) == 0:
+        Path(file_path).unlink(missing_ok=True)
+        raise HTTPException(400, "The CSV file must contain at least one data row and one column")
+
     summary = profile_dataframe(df)
+    dataset_hash = hashlib.sha256(contents).hexdigest()
 
     dataset = Dataset(
         id=dataset_id,
-        filename=file.filename,
+        filename=filename,
         file_path=file_path,
         n_rows=len(df),
         n_cols=len(df.columns),
         column_summary=summary,
+        dataset_hash=dataset_hash,
     )
     db.add(dataset)
     db.commit()
@@ -62,6 +81,7 @@ def preview_dataset(dataset_id: uuid.UUID, rows: int = 10, db: Session = Depends
     if not dataset:
         raise HTTPException(404, "Dataset not found")
 
+    rows = max(1, min(rows, settings.max_preview_rows))
     df = pd.read_csv(dataset.file_path).head(rows)
     df = df.where(pd.notnull(df), None)
     return {"columns": list(df.columns), "rows": df.to_dict(orient="records")}

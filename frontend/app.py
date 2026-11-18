@@ -7,6 +7,8 @@ import requests
 import streamlit as st
 
 API_URL = os.environ.get("API_URL", "http://localhost:8000")
+PUBLIC_API_URL = os.environ.get("PUBLIC_API_URL", "http://localhost:8000")
+MLFLOW_UI_URL = os.environ.get("MLFLOW_UI_URL", "http://localhost:5000")
 API_KEY = os.environ.get("API_KEY", "changeme")
 GITHUB_URL = "https://github.com/Hvora2005/mlops-platform"
 
@@ -259,6 +261,69 @@ def model_display_name(key: str) -> str:
     return MODEL_INFO.get(key, (None, key.replace("_", " ").title(), None))[1]
 
 
+def api_request(method: str, path: str, **kwargs):
+    kwargs.setdefault("timeout", 15)
+    try:
+        return requests.request(method, f"{API_URL}{path}", **kwargs)
+    except requests.exceptions.RequestException as exc:
+        st.error(f"Backend unavailable. Check that the API is running at {API_URL}. ({exc})")
+        return None
+
+
+def restore_saved_state() -> None:
+    """Restore the latest dataset and completed run when Streamlit refreshes."""
+    if "dataset" not in st.session_state:
+        response = api_request("GET", "/datasets")
+        if response is not None and response.ok:
+            datasets = response.json()
+            if datasets:
+                st.session_state["dataset"] = datasets[0]
+    if "dataset" in st.session_state and "run" not in st.session_state:
+        response = api_request(
+            "GET", "/training/runs", params={"dataset_id": st.session_state["dataset"]["id"]}
+        )
+        if response is not None and response.ok:
+            completed = [run for run in response.json() if run.get("status") == "completed"]
+            if completed:
+                detail = api_request("GET", f"/training/{completed[0]['id']}")
+                if detail is not None and detail.ok:
+                    st.session_state["run"] = detail.json()
+
+
+def show_drift_report(report: dict | None) -> None:
+    if not report:
+        return
+    status = report.get("status", "unknown")
+    message = (
+        f"Incoming batch drift status: {status}. "
+        f"{report.get('drifted_feature_count', 0)} drifted features across "
+        f"{report.get('incoming_row_count', 0)} rows."
+    )
+    if status == "drifted":
+        st.error(message)
+    elif status == "warning":
+        st.warning(message)
+    elif status == "insufficient_data":
+        st.info(message + f" Minimum batch size is {os.environ.get('DRIFT_MIN_BATCH_SIZE', '30')}.")
+    else:
+        st.success(message)
+    feature_rows = []
+    for name, result in report.get("features", {}).items():
+        feature_rows.append(
+            {
+                "feature": name,
+                "method": result.get("method"),
+                "score": result.get("score"),
+                "status": result.get("status"),
+            }
+        )
+    if feature_rows:
+        st.dataframe(pd.DataFrame(feature_rows), hide_index=True, use_container_width=True)
+
+
+restore_saved_state()
+
+
 # ---- Header ----
 st.markdown(
     f"""
@@ -271,7 +336,8 @@ st.markdown(
             </div>
         </div>
         <div class="links">
-            <a href="{API_URL}/docs" target="_blank">API Reference</a>
+            <a href="{PUBLIC_API_URL}/docs" target="_blank">API Reference</a>
+            <a href="{MLFLOW_UI_URL}" target="_blank">MLflow</a>
             <a href="{GITHUB_URL}" target="_blank">Source</a>
         </div>
     </div>
@@ -351,11 +417,8 @@ with st.sidebar:
     if has_dataset:
         st.markdown("---")
         st.markdown('<div class="side-section-title">Recent runs</div>', unsafe_allow_html=True)
-        try:
-            resp = requests.get(f"{API_URL}/training/runs", params={"dataset_id": st.session_state["dataset"]["id"]}, timeout=5)
-            runs = resp.json() if resp.ok else []
-        except requests.exceptions.RequestException:
-            runs = []
+        resp = api_request("GET", "/training/runs", params={"dataset_id": st.session_state["dataset"]["id"]})
+        runs = resp.json() if resp is not None and resp.ok else []
         if not runs:
             st.caption("No runs yet.")
         else:
@@ -392,17 +455,18 @@ with tab_upload:
             if "run" in st.session_state:
                 st.toast("Previous training results were cleared for the new dataset.")
             with st.spinner("Uploading and profiling..."):
-                resp = requests.post(
-                    f"{API_URL}/datasets/upload",
+                resp = api_request(
+                    "POST",
+                    "/datasets/upload",
                     files={"file": (uploaded.name, uploaded.getvalue(), "text/csv")},
                 )
-            if resp.ok:
+            if resp is not None and resp.ok:
                 st.session_state["dataset"] = resp.json()
                 st.session_state.pop("run", None)
                 st.session_state.pop("active_run_id", None)
                 st.toast(f"Uploaded {resp.json()['filename']}")
                 st.rerun()
-            else:
+            elif resp is not None:
                 st.error(resp.text)
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -430,14 +494,14 @@ with tab_upload:
         st.write("")
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="subhead">Data preview</div>', unsafe_allow_html=True)
-        try:
-            preview_resp = requests.get(f"{API_URL}/datasets/{ds['id']}/preview", timeout=10)
+        preview_resp = api_request("GET", f"/datasets/{ds['id']}/preview")
+        if preview_resp is not None:
             if preview_resp.ok:
                 preview = preview_resp.json()
                 st.dataframe(pd.DataFrame(preview["rows"], columns=preview["columns"]), use_container_width=True)
             else:
                 st.caption("Preview unavailable.")
-        except requests.exceptions.RequestException:
+        else:
             st.caption("Preview unavailable.")
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -474,11 +538,8 @@ with tab_train:
         # is what actually prevents a duplicate submission from launching a second,
         # competing training job on the same machine.
         run_id = st.session_state["active_run_id"]
-        try:
-            poll = requests.get(f"{API_URL}/training/{run_id}", timeout=10)
-            poll_data = poll.json()
-        except requests.exceptions.RequestException:
-            poll_data = {"status": "running"}
+        poll = api_request("GET", f"/training/{run_id}")
+        poll_data = poll.json() if poll is not None and poll.ok else {"status": "running"}
 
         status = poll_data.get("status", "running")
         if status == "completed":
@@ -538,14 +599,15 @@ with tab_train:
         st.write("")
 
         if st.button("Train & tune models"):
-            resp = requests.post(
-                f"{API_URL}/training/run",
+            resp = api_request(
+                "POST",
+                "/training/run",
                 json={"dataset_id": ds["id"], "target_column": target_column, "task_type": task_type},
             )
-            if resp.ok:
+            if resp is not None and resp.ok:
                 st.session_state["active_run_id"] = resp.json()["id"]
                 st.rerun()
-            else:
+            elif resp is not None:
                 st.error(resp.text)
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -580,13 +642,36 @@ with tab_results:
             unsafe_allow_html=True,
         )
 
+        meta_cols = st.columns(3)
+        with meta_cols[0]:
+            st.caption(f"Training run: `{run['id']}`")
+        with meta_cols[1]:
+            if st.session_state.get("dataset", {}).get("dataset_hash"):
+                st.caption(f"Dataset SHA-256: `{st.session_state['dataset']['dataset_hash']}`")
+        with meta_cols[2]:
+            if run.get("mlflow_run_id"):
+                st.markdown(f"[Open MLflow]({MLFLOW_UI_URL})")
+                st.caption(f"Run: `{run['mlflow_run_id']}`")
+        monitoring = api_request("GET", f"/training/{run['id']}/monitoring")
+        if monitoring is not None and monitoring.ok:
+            monitor_data = monitoring.json()
+            monitor_cols = st.columns(4)
+            monitor_cols[0].metric("Prediction requests", monitor_data["total_prediction_requests"])
+            monitor_cols[1].metric("Predicted rows", monitor_data["total_predicted_rows"])
+            monitor_cols[2].metric("Avg latency", f"{monitor_data['average_latency_ms']:.1f} ms")
+            monitor_cols[3].metric("Latest drift", monitor_data["most_recent_drift_status"] or "—")
+            if monitor_data.get("most_recent_drift_report"):
+                with st.expander("Latest drift report"):
+                    show_drift_report(monitor_data["most_recent_drift_report"])
+
         metrics_df = pd.DataFrame(run["metrics"]).T
         metric_cols = list(metrics_df.columns)
 
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="subhead">Model comparison</div>', unsafe_allow_html=True)
-        chart_metric = "f1" if "f1" in metric_cols else metric_cols[0]
-        chart_metric = st.selectbox("Compare by metric", metric_cols, index=metric_cols.index(chart_metric))
+        chartable_metrics = [column for column in metric_cols if column != "confusion_matrix"]
+        chart_metric = "f1" if "f1" in chartable_metrics else chartable_metrics[0]
+        chart_metric = st.selectbox("Compare by metric", chartable_metrics, index=chartable_metrics.index(chart_metric))
 
         model_names = [model_display_name(n) for n in metrics_df.index]
         bar_colors = [ACCENT if n == best_key else T["track"] for n in metrics_df.index]
@@ -600,10 +685,14 @@ with tab_results:
 
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown('<div class="subhead">Full metrics table</div>', unsafe_allow_html=True)
-        st.dataframe(
-            metrics_df.rename(index=model_display_name).style.highlight_max(axis=0, color="rgba(26,158,107,0.18)"),
-            use_container_width=True,
-        )
+        styled_metrics = metrics_df.rename(index=model_display_name).style
+        max_metrics = {"accuracy", "precision", "recall", "f1", "roc_auc", "r2"}
+        min_metrics = {"rmse", "mae"}
+        for metric in max_metrics.intersection(metrics_df.columns):
+            styled_metrics = styled_metrics.highlight_max(subset=[metric], color="rgba(26,158,107,0.18)")
+        for metric in min_metrics.intersection(metrics_df.columns):
+            styled_metrics = styled_metrics.highlight_min(subset=[metric], color="rgba(26,158,107,0.18)")
+        st.dataframe(styled_metrics, use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
 
         if run.get("feature_importance"):
@@ -653,24 +742,31 @@ with tab_predict:
 
             inputs = {}
             cols = st.columns(2)
+            column_summary = st.session_state.get("dataset", {}).get("column_summary", {})
             for i, col in enumerate(run["feature_columns"]):
                 with cols[i % 2]:
-                    inputs[col] = st.text_input(col, key=f"predict_{col}")
+                    dtype = column_summary.get(col, {}).get("dtype", "")
+                    if dtype.startswith(("int", "float", "uint")):
+                        inputs[col] = st.number_input(col, value=0.0, key=f"predict_{col}")
+                    else:
+                        inputs[col] = st.text_input(col, key=f"predict_{col}")
 
             if st.button("Predict"):
-                blank_fields = [col for col, val in inputs.items() if val.strip() == ""]
+                blank_fields = [col for col, val in inputs.items() if isinstance(val, str) and val.strip() == ""]
                 if blank_fields:
                     st.warning(f"Fill in all fields before predicting. Missing: {', '.join(blank_fields)}")
                     resp = None
                 else:
-                    resp = requests.post(
-                        f"{API_URL}/training/predict",
+                    resp = api_request(
+                        "POST",
+                        "/training/predict",
                         json={"training_run_id": run["id"], "records": [inputs]},
                         headers={"x-api-key": API_KEY},
                     )
                 if resp is not None and resp.ok:
                     prediction = resp.json()["predictions"][0]
                     st.toast("Prediction ready")
+                    show_drift_report(resp.json().get("drift_report"))
                     st.markdown(
                         f"""
                         <div class="best-model-banner">
@@ -705,16 +801,18 @@ with tab_predict:
                     st.dataframe(batch_df.head(10), use_container_width=True)
                     if st.button("Predict for all rows"):
                         records = batch_df[run["feature_columns"]].to_dict(orient="records")
-                        resp = requests.post(
-                            f"{API_URL}/training/predict",
+                        resp = api_request(
+                            "POST",
+                            "/training/predict",
                             json={"training_run_id": run["id"], "records": records},
                             headers={"x-api-key": API_KEY},
                         )
-                        if resp.ok:
+                        if resp is not None and resp.ok:
                             predictions = resp.json()["predictions"]
                             result_df = batch_df.copy()
                             result_df["prediction"] = predictions
                             st.toast(f"{len(predictions)} predictions ready")
+                            show_drift_report(resp.json().get("drift_report"))
                             st.dataframe(result_df, use_container_width=True)
                             st.download_button(
                                 "Download predictions (CSV)",
@@ -722,7 +820,7 @@ with tab_predict:
                                 file_name="predictions.csv",
                                 mime="text/csv",
                             )
-                        else:
+                        elif resp is not None:
                             st.error(resp.text)
             st.markdown("</div>", unsafe_allow_html=True)
 
